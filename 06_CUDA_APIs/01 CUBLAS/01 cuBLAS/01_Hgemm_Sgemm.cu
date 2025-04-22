@@ -3,10 +3,11 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <time.h>
 
-#define M 3
-#define K 4
-#define N 2
+#define M 512
+#define K 512
+#define N 512
 
 #define CHECK_CUDA(call) { \
     cudaError_t err = call; \
@@ -43,13 +44,41 @@ void cpu_matmul(float *A, float *B, float *C) {
         }
 }
 
-int main() {
-    float A[M * K] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
-    float B[K * N] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
-    float C_cpu[M * N], C_cublas_s[M * N], C_cublas_h[M * N];
+double get_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
+void init_vector(float *vec, int n) {
+    for (int i = 0; i < n; i++) {
+        vec[i] = (float)rand() / RAND_MAX;
+    }
+}
+
+int main() {
+
+    float A[M * K];
+    float B[K * N];
+    float C_cpu[M * N], C_cublas_s[M * N], C_cublas_h[M * N];
+    
+    srand(time(NULL));
+    init_vector(A, M*K);
+    init_vector(B, K*N);
+
+    double cpu_time = 0.0;
     // CPU matmul
+    double start_time = get_time();
     cpu_matmul(A, B, C_cpu);
+    double end_time = get_time();
+    cpu_time += end_time - start_time;
+
+    printf("cpu matmul time: %f\n", cpu_time*1000);
+
+    cudaEvent_t start, end;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
 
     // CUDA setup
     cublasHandle_t handle;
@@ -80,9 +109,19 @@ int main() {
     // 1.0 5.0 2.0 6.0 3.0 7.0 4.0 8.0
     
     // cuBLAS SGEMM
+    cudaStream_t s1, s2;
+    cudaStreamCreate(&s1);
+    cublasSetStream(handle, s1);
     float alpha = 1.0f, beta = 0.0f;
+    cudaEventRecord(start, s1);
     CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
+    cudaEventRecord(end, s1);
+    float ms = 0;
+    cudaEventSynchronize(end);
+    cudaEventElapsedTime(&ms, start, end);
+    printf("FP32 gpu matmul time: %f\n", ms);
     CHECK_CUDA(cudaMemcpy(C_cublas_s, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+    
 
     // cuBLAS HGEMM
     half *d_A_h, *d_B_h, *d_C_h;
@@ -103,27 +142,54 @@ int main() {
     CHECK_CUDA(cudaMemcpy(d_A_h, A_h, M * K * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B_h, B_h, K * N * sizeof(half), cudaMemcpyHostToDevice));
 
-    __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
-    CHECK_CUBLAS(cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha_h, d_B_h, N, d_A_h, K, &beta_h, d_C_h, N));
-
     // Copy result back to host and convert to float
+    
+    cublasHandle_t handle2;
+    CHECK_CUBLAS(cublasCreate(&handle2));
+
+    cudaEvent_t start2, end2;
+
+    cudaEventCreate(&start2);
+    cudaEventCreate(&end2);
+    
     half C_h[M * N];
+    cudaStreamCreate(&s2);
+    cublasSetStream(handle2, s2);
+    cudaEventRecord(start2, s2);
+    CHECK_CUBLAS(cublasGemmEx(
+        handle2,
+        CUBLAS_OP_T, CUBLAS_OP_T,
+        N, M, K,
+        &alpha,
+        d_B_h, CUDA_R_16F, N,
+        d_A_h, CUDA_R_16F, K,
+        &beta,
+        d_C_h, CUDA_R_16F, N,
+        CUDA_R_16F,
+        CUBLAS_GEMM_DFALT_TENSOR_OP
+    ));
+    
+    cudaEventRecord(end2, s2);
+    cudaEventSynchronize(end2);
+    cudaEventElapsedTime(&ms, start2, end2);
     CHECK_CUDA(cudaMemcpy(C_h, d_C_h, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+
+    printf("FP16 gpu matmul time: %f\n", ms);
     for (int i = 0; i < M * N; i++) {
         C_cublas_h[i] = __half2float(C_h[i]);
     }
 
     // Print results
-    printf("Matrix A (%dx%d):\n", M, K);
-    PRINT_MATRIX(A, M, K);
-    printf("Matrix B (%dx%d):\n", K, N);
-    PRINT_MATRIX(B, K, N);
-    printf("CPU Result (%dx%d):\n", M, N);
-    PRINT_MATRIX(C_cpu, M, N);
-    printf("cuBLAS SGEMM Result (%dx%d):\n", M, N);
-    PRINT_MATRIX(C_cublas_s, M, N);
-    printf("cuBLAS HGEMM Result (%dx%d):\n", M, N);
-    PRINT_MATRIX(C_cublas_h, M, N);
+    // printf("Matrix A (%dx%d):\n", M, K);
+    // PRINT_MATRIX(A, M, K);
+    // printf("Matrix B (%dx%d):\n", K, N);
+    // PRINT_MATRIX(B, K, N);
+    // printf("CPU Result (%dx%d):\n", M, N);
+    // PRINT_MATRIX(C_cpu, M, N);
+    // printf("cuBLAS SGEMM Result (%dx%d):\n", M, N);
+    // PRINT_MATRIX(C_cublas_s, M, N);
+    // printf("cuBLAS HGEMM Result (%dx%d):\n", M, N);
+    // PRINT_MATRIX(C_cublas_h, M, N);
 
     // Clean up
     CHECK_CUDA(cudaFree(d_A));
@@ -132,7 +198,15 @@ int main() {
     CHECK_CUDA(cudaFree(d_A_h));
     CHECK_CUDA(cudaFree(d_B_h));
     CHECK_CUDA(cudaFree(d_C_h));
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(end));
+    CHECK_CUDA(cudaEventDestroy(start2));
+    CHECK_CUDA(cudaEventDestroy(end2));
+    CHECK_CUDA(cudaStreamDestroy(s1));
+    CHECK_CUDA(cudaStreamDestroy(s2));
+
     CHECK_CUBLAS(cublasDestroy(handle));
+    CHECK_CUBLAS(cublasDestroy(handle2));
 
     return 0;
 }
